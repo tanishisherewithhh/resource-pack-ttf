@@ -5,6 +5,7 @@ import pathlib
 import json
 import datetime
 import zipfile
+
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
 import pygame
 import PIL.Image
@@ -12,31 +13,45 @@ import fontTools.fontBuilder
 import fontTools.pens.ttGlyphPen
 import fontTools.ttLib.tables._g_l_y_f
 
+class ResourceProvider:
+    def __init__(self, jar_zip: zipfile.ZipFile, pack_paths: list[pathlib.Path]):
+        self.jar = jar_zip
+        self.packs = []
+        for p in pack_paths:
+            if p.suffix == '.zip':
+                try:
+                    self.packs.append(zipfile.ZipFile(p, 'r'))
+                except Exception as e:
+                    print(f"Warning: Could not read zip {p}: {e}")
+            elif p.is_dir():
+                # This allows you to just extract your RAR into a folder
+                self.packs.append(p)
 
-def main():
-    latest = get_latest()
-    name = latest['id']
-    meta_url = latest['url']
-    cached_path = pathlib.Path(f'cache/minecraft-{name}.jar')
-    if not cached_path.exists():
-        print(f'Downloading minecraft jar {name}...')
-        response = requests.get(meta_url)
-        data = response.json()
-        client_jar = data['downloads']['client']['url']
-        response = requests.get(client_jar)
-        cached_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(cached_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=16 * 1024):
-                f.write(chunk)
-    aglfn = get_aglfn()
-    print('Converting fonts...')
-    with zipfile.ZipFile(cached_path, 'r') as jar:
-        # TTF metadata includes a creation date
-        # this information isn't in the jar, so we have to provide it ourselves
-        convert_font('Default', 'assets/minecraft/font/default.json', jar, datetime.datetime.fromisoformat('2009-05-16T16:52:00Z'), aglfn)
-        convert_font('Enchanting', 'assets/minecraft/font/alt.json', jar, datetime.datetime.fromisoformat('2011-10-06T00:00:00Z'), aglfn)
-        convert_font('Illager Runes', 'assets/minecraft/font/illageralt.json', jar, datetime.datetime.fromisoformat('2021-09-15T16:04:30Z'), aglfn)
-    print('Done!')
+    def get_resource(self, path: str):
+        # Check Resource Packs
+        for pack in reversed(self.packs):
+            if isinstance(pack, zipfile.ZipFile):
+                # ZipFile uses forward slashes
+                zip_path = path.replace('\\', '/')
+                if zip_path in pack.namelist():
+                    info = pack.getinfo(zip_path)
+                    return pack.read(zip_path), date_time(info.date_time)
+            else:
+                # Path object handles OS-specific slashes
+                full_path = pack / path
+                if full_path.exists():
+                    mtime = datetime.datetime.fromtimestamp(
+                        full_path.stat().st_mtime, 
+                        tz=datetime.timezone.utc
+                    )
+                    return full_path.read_bytes(), mtime
+        
+        # Fallback to JAR
+        zip_jar_path = path.replace('\\', '/')
+        if zip_jar_path in self.jar.namelist():
+            return self.jar.read(zip_jar_path), date_time(self.jar.getinfo(zip_jar_path).date_time)
+        
+        raise FileNotFoundError(f"Could not find resource: {path}")
 
 def get_latest() -> dict:
     cached_path = pathlib.Path('cache/manifest.json')
@@ -51,13 +66,13 @@ def get_latest() -> dict:
         cached_path.parent.mkdir(parents=True, exist_ok=True)
         with open(cached_path, 'w', encoding='utf-8') as f:
             json.dump(data, f)
+    
     snapshot_id = data['latest']['snapshot']
     for version in data['versions']:
         if version['id'] == snapshot_id:
             return version
     raise ValueError(snapshot_id)
 
-# The Adobe Glyph List For New Fonts tells us what names to use for the glyphs that characters are mapped to
 def get_aglfn() -> dict[str, str]:
     cached_path = pathlib.Path('cache/aglfn.txt')
     if not cached_path.exists():
@@ -78,52 +93,53 @@ def get_aglfn() -> dict[str, str]:
             aglfn_map[codepoint] = name
     return aglfn_map
 
-def read_json(jar: zipfile.ZipFile, resource: str, kind: str) -> tuple[dict, datetime.datetime]:
+def read_json(provider: ResourceProvider, resource: str, kind: str):
     namespace, rest = resource.split(':')
     path = f'assets/{namespace}/{kind}/{rest}.json'
-    text = jar.read(path)
-    data = json.loads(text)
-    date = jar.getinfo(path).date_time
-    return (data, date_time(date))
+    data_bytes, date = provider.get_resource(path)
+    return json.loads(data_bytes), date
 
-def read_image(jar: zipfile.ZipFile, resource: str) -> tuple[PIL.Image.Image, datetime.datetime]:
+def read_image(provider: ResourceProvider, resource: str):
     namespace, rest = resource.split(':')
     path = f'assets/{namespace}/textures/{rest}'
-    data = jar.read(path)
-    img = PIL.Image.open(io.BytesIO(data))
-    date = jar.getinfo(path).date_time
-    return (img, date_time(date))
+    data_bytes, date = provider.get_resource(path)
+    img = PIL.Image.open(io.BytesIO(data_bytes))
+    return img, date
 
 def date_time(jartime: tuple) -> datetime.datetime:
     y, m, d, h, mm, s = jartime
     return datetime.datetime(y, m, d, h, mm, s, 0, tzinfo=datetime.timezone.utc)
 
-def convert_font(name: str, entry: str, jar: zipfile.ZipFile, created_date: datetime.datetime, aglfn: dict[str, str]):
-    modified_date = date_time(jar.getinfo(entry).date_time)
-    text = jar.read(entry)
-    data = json.loads(text)
+def convert_font(name: str, entry: str, provider: ResourceProvider, created_date: datetime.datetime, aglfn: dict[str, str]):
+    try:
+        text_bytes, modified_date = provider.get_resource(entry)
+    except FileNotFoundError:
+        print(f"Skipping {name}: {entry} not found.")
+        return
+
+    data = json.loads(text_bytes)
     providers: list[dict] = []
     providers.extend(data['providers'])
+    
     index = 0
     while index < len(providers):
         if providers[index]['type'] == 'reference':
-            (reference, date) = read_json(jar, providers[index]['id'], 'font')
+            (reference, date) = read_json(provider, providers[index]['id'], 'font')
             if date > modified_date:
                 modified_date = date
             del providers[index]
             providers[index:index] = reference['providers']
         index += 1
+
     seen_chars = set()
     fonts = {'Regular': {}, 'Bold': {}, 'Italic': {}, 'Bold Italic': {}}
     chatbox_height = 12
     font_em = 1200
     pixel_scale = font_em / chatbox_height
-    # font textures have a color depth of 1 bit, so they are just 2D bitmasks
-    # this lets us leverage some efficient operations provided by pygame
+
     def add_bitmap_glyph(char: str, mask: pygame.mask.Mask, height: int, ascent: int):
         m_width, m_height = mask.get_size()
         seen_chars.add(char)
-        # bold characters are created by overlapping two copies of the texture
         bold_mask = pygame.mask.Mask((m_width + 1, m_height), fill=False)
         bold_mask.draw(mask, (0, 0))
         bold_mask.draw(mask, (1, 0))
@@ -139,6 +155,8 @@ def convert_font(name: str, entry: str, jar: zipfile.ZipFile, created_date: date
         fonts['Italic'][char] = {'width': (iw + add_width) * scale, 'height': ih * scale, 'path': italic_path}
         fonts['Bold'][char] = {'width': (bw + add_width) * scale, 'height': bh * scale, 'path': bold_path}
         fonts['Bold Italic'][char] = {'width': (biw + add_width) * scale, 'height': bih * scale, 'path': bold_italic_path}
+
+    # Default missing glyph
     mw, mh = (5, 8)
     missing = pygame.mask.Mask((mw, mh), fill=False)
     for y in range(mh):
@@ -146,38 +164,37 @@ def convert_font(name: str, entry: str, jar: zipfile.ZipFile, created_date: date
             if x == 0 or y == 0 or x == mw - 1 or y == mh - 1:
                 missing.set_at((x, y), 1)
     add_bitmap_glyph('.notdef', missing, 8, 8)
-    for provider in providers:
-        if provider['type'] == 'space':
-            for char,width in provider['advances'].items():
-                if char in seen_chars:
-                    continue
+
+    for provider_data in providers:
+        if provider_data['type'] == 'space':
+            for char, width in provider_data['advances'].items():
+                if char in seen_chars: continue
                 seen_chars.add(char)
                 fonts['Regular'][char] = {'width': width * pixel_scale, 'height': 0, 'path': None}
                 fonts['Italic'][char] = {'width': width * pixel_scale, 'height': 0, 'path': None}
                 fonts['Bold'][char] = {'width': (width + 1) * pixel_scale, 'height': 0, 'path': None}
                 fonts['Bold Italic'][char] = {'width': (width + 1) * pixel_scale, 'height': 0, 'path': None}
-        elif provider['type'] == 'bitmap':
-            (img, date) = read_image(jar, provider['file'])
+        elif provider_data['type'] == 'bitmap':
+
+            (img, date) = read_image(provider, provider_data['file'])
             if date > modified_date:
                 modified_date = date
-            height = provider.get('height', 8)
-            ascent = provider['ascent']
-            glyph_width = img.width // len(provider['chars'][0])
-            glyph_height = img.height // len(provider['chars'])
-            for y,row in enumerate(provider['chars']):
-                for x,char in enumerate(row):
-                    if char == '\u0000':
-                        continue
-                    if char in seen_chars:
-                        continue
+            height = provider_data.get('height', 8)
+            ascent = provider_data['ascent']
+            glyph_width = img.width // len(provider_data['chars'][0])
+            glyph_height = img.height // len(provider_data['chars'])
+            for y, row in enumerate(provider_data['chars']):
+                for x, char in enumerate(row):
+                    if char == '\u0000' or char in seen_chars: continue
                     glyph = img.crop((x * glyph_width, y * glyph_height, (x + 1) * glyph_width, (y + 1) * glyph_height)).convert('RGBA')
                     surface = pygame.image.fromstring(glyph.tobytes(), glyph.size, 'RGBA')
                     mask = pygame.mask.from_surface(surface)
                     add_bitmap_glyph(char, mask, height, ascent)
-    for style, data in fonts.items():
+
+    for style, data_style in fonts.items():
         full_name = 'Minecraft ' + name
         ttf_name = full_name.replace(' ', '') + '-' + style.replace(' ', '')
-        font = make_font(full_name, style, font_em, (created_date, modified_date), data, aglfn)
+        font = make_font(full_name, style, font_em, (created_date, modified_date), data_style, aglfn)
         dest = pathlib.Path(f'out/{ttf_name}.ttf')
         dest.parent.mkdir(parents=True, exist_ok=True)
         font.save(dest)
@@ -402,6 +419,40 @@ def vectorize(mask: pygame.mask.Mask, scale: float, offset: tuple[float, float],
             pen_pos['next'] = None
             pen.closePath()
     return (pen.glyph(), size)
+
+def main():
+    latest = get_latest()
+    name = latest['id']
+    meta_url = latest['url']
+    cached_path = pathlib.Path(f'cache/minecraft-{name}.jar')
+    
+    if not cached_path.exists():
+        print(f'Downloading minecraft jar {name}...')
+        response = requests.get(meta_url)
+        data = response.json()
+        client_jar = data['downloads']['client']['url']
+        response = requests.get(client_jar)
+        cached_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cached_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=16 * 1024):
+                f.write(chunk)
+
+    aglfn = get_aglfn()
+    resource_pack_dir = pathlib.Path('resource_packs')
+    custom_packs = [p for p in resource_pack_dir.iterdir() if p.is_dir() or p.suffix == '.zip']
+
+    print('Converting fonts...')
+    with zipfile.ZipFile(cached_path, 'r') as jar:
+        provider = ResourceProvider(jar, custom_packs)
+        font_configs = [
+            ('Default', 'assets/minecraft/font/default.json', '2009-05-16T16:52:00Z'),
+            ('Enchanting', 'assets/minecraft/font/alt.json', '2011-10-06T00:00:00Z'),
+            ('Illager Runes', 'assets/minecraft/font/illageralt.json', '2021-09-15T16:04:30Z')
+        ]
+        for font_name, json_path, default_date in font_configs:
+            convert_font(font_name, json_path, provider, datetime.datetime.fromisoformat(default_date), aglfn)
+
+    print('Done!')
 
 if __name__ == '__main__':
     main()
